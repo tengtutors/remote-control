@@ -1,0 +1,141 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Remote Control (WebRTC)</title>
+    <style>
+      body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b1117;color:#e5e7eb;margin:0}
+      .wrap{max-width:960px;margin:40px auto;padding:24px}
+      .card{background:#111827;border:1px solid #1f2937;border-radius:16px;padding:20px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+      .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+      input,button{font-size:16px;border-radius:10px;border:1px solid #374151;padding:10px 12px;background:#0b1220;color:#e5e7eb}
+      button{cursor:pointer}
+      video{width:100%;max-height:70vh;background:#000;border-radius:12px;border:1px solid #1f2937}
+      .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#0b1220;border:1px solid #1f2937}
+      small{color:#9ca3af}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h2>Remote Control (WebRTC)</h2>
+        <div class="row">
+          <label>Room Code (6 digits)</label>
+          <input id="code" placeholder="e.g. 482913" maxlength="6" />
+          <button id="host">Host (Share Screen)</button>
+          <button id="viewer">Viewer (Control)</button>
+          <span class="pill"><small id="status">idle</small></span>
+        </div>
+        <p><small>Share the 6-digit code with your Viewer. They join to see your screen and send controls.</small></p>
+        <video id="remote" autoplay playsinline></video>
+      </div>
+    </div>
+
+    <script>
+      // Use same-origin secure WebSocket (works on Render/HTTPS)
+      const wsUrl = location.origin.replace(/^http/, "ws") + "/socket";
+
+      let pc, dc, ws, isHost = false;
+      const statusEl = document.getElementById('status');
+      const codeEl = document.getElementById('code');
+      const remoteVideo = document.getElementById('remote');
+
+      function setStatus(t){ statusEl.textContent = t }
+      function roomCode(){ return (codeEl.value||'').replace(/\D/g,'').slice(0,6) }
+
+      async function initPeer(){
+        pc = new RTCPeerConnection({
+          iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }]
+        });
+
+        pc.onicecandidate = e => {
+          if (e.candidate) send({ type: 'ice', candidate: e.candidate });
+        };
+        pc.ontrack = e => { remoteVideo.srcObject = e.streams[0]; };
+        pc.ondatachannel = e => { dc = e.channel; wireDataChannel(); };
+      }
+
+      function wireDataChannel(){
+        dc.onopen = () => setStatus('datachannel open');
+        dc.onmessage = (evt) => {
+          if (isHost) {
+            // If you run the local helper on the Host, forward evt.data to ws://127.0.0.1:8765
+            // Example (uncomment if Host has helper running):
+            // helper.readyState === 1 && helper.send(evt.data);
+            console.log('control -> host', evt.data);
+          }
+        };
+      }
+
+      function send(obj){ ws && ws.readyState===1 && ws.send(JSON.stringify(obj)); }
+
+      function connectSignaling(code){
+        return new Promise((resolve) => {
+          ws = new WebSocket(wsUrl);
+          ws.onopen = () => { ws.send(JSON.stringify({ type:'join', code })); };
+          ws.onmessage = async (evt) => {
+            const data = JSON.parse(evt.data);
+            if (data.type === 'joined') { setStatus('joined '+data.code); resolve(); }
+            if (data.type === 'offer' && !isHost) {
+              await initPeer();
+              await pc.setRemoteDescription(data.sdp);
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              send({ type:'answer', sdp: pc.localDescription });
+            }
+            if (data.type === 'answer' && isHost) {
+              pc.setRemoteDescription(data.sdp);
+            }
+            if (data.type === 'ice') {
+              pc.addIceCandidate(data.candidate);
+            }
+          };
+        });
+      }
+
+      async function startHost(){
+        const code = roomCode();
+        if (code.length !== 6) return alert('Enter a 6-digit room code');
+        isHost = true; setStatus('hosting…');
+        await connectSignaling(code);
+        await initPeer();
+        dc = pc.createDataChannel('control'); wireDataChannel();
+        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+        stream.getTracks().forEach(t => pc.addTrack(t, stream));
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        send({ type:'offer', sdp: pc.localDescription });
+      }
+
+      async function startViewer(){
+        const code = roomCode();
+        if (code.length !== 6) return alert('Enter a 6-digit room code');
+        isHost = false; setStatus('viewing…');
+        await connectSignaling(code);
+        remoteVideo.addEventListener('loadedmetadata', () => setStatus('streaming'));
+        // send controls to host
+        window.addEventListener('mousemove', (e) => {
+          if (!dc || dc.readyState !== 'open') return;
+          const rect = remoteVideo.getBoundingClientRect();
+          const nx = (e.clientX - rect.left) / rect.width;
+          const ny = (e.clientY - rect.top) / rect.height;
+          if (nx>=0 && nx<=1 && ny>=0 && ny<=1) {
+            dc.send(JSON.stringify({ type:'mouse', kind:'move', x:nx, y:ny }));
+          }
+        });
+        window.addEventListener('mousedown', (e)=>{ if(dc&&dc.readyState==='open') dc.send(JSON.stringify({type:'mouse',kind:'down',button:e.button}))});
+        window.addEventListener('mouseup',   (e)=>{ if(dc&&dc.readyState==='open') dc.send(JSON.stringify({type:'mouse',kind:'up',button:e.button}))});
+        window.addEventListener('wheel',     (e)=>{ if(dc&&dc.readyState==='open') dc.send(JSON.stringify({type:'mouse',kind:'wheel',deltaX:e.deltaX,deltaY:e.deltaY}))});
+        window.addEventListener('keydown',   (e)=>{ if(dc&&dc.readyState==='open') dc.send(JSON.stringify({type:'key',kind:'down',key:e.key,code:e.code}))});
+        window.addEventListener('keyup',     (e)=>{ if(dc&&dc.readyState==='open') dc.send(JSON.stringify({type:'key',kind:'up',key:e.key,code:e.code}))});
+      }
+
+      // Optional local helper forwarder for the Host (uncomment if using helper)
+      // const helper = new WebSocket('ws://127.0.0.1:8765');
+
+      document.getElementById('host').onclick = startHost;
+      document.getElementById('viewer').onclick = startViewer;
+    </script>
+  </body>
+</html>
